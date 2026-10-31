@@ -7,18 +7,24 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from ytmusicapi import YTMusic
 
-API_ID     = int(os.environ["API_ID"])
-API_HASH   = os.environ["API_HASH"]
-SESSION    = os.environ["SESSION"]
-DB_CHANNEL = int(os.getenv("ARC_DB_CHANNEL_ID", "-1001677848376"))
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", "123")
+# ============ CONFIG ============
+API_ID   = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION  = os.environ["SESSION"]
+
+DEFAULT_DB_URL     = "postgresql://neondb_owner:npg_G7efH9DhxOmg@ep-snowy-king-a1cz8but.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+DEFAULT_CHANNEL_ID = "-1001677848376"
+DEFAULT_TOKEN      = "123"
+
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+DB_CHANNEL   = int(os.getenv("ARC_DB_CHANNEL_ID", DEFAULT_CHANNEL_ID))
+ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", DEFAULT_TOKEN)
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 ytm = YTMusic()
 _rebuild_lock = asyncio.Lock()
 
-# ---------- storage: only video_id -> msg_id ----------
+# ============ STORAGE ============
 if DATABASE_URL:
     import asyncpg
     IS_PG = True
@@ -79,7 +85,7 @@ else:
     def row_msg(r): return r[1]
     def row_channel(r): return r[2]
 
-# ---------- indexer ----------
+# ============ INDEXER ============
 def _extract_video_id(msg):
     txt = (msg.message or "").strip()
     m = re.search(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", txt)
@@ -108,7 +114,7 @@ async def index_channel():
         await db_upsert(batch)
     return count
 
-# ---------- app ----------
+# ============ APP ============
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await client.start()
@@ -130,10 +136,8 @@ async def rebuild(token: str = Query("")):
     async with _rebuild_lock:
         return {"indexed": await index_channel()}
 
-# ---------- THE KEY ENDPOINT: search by name ----------
 @app.get("/search")
 async def search(q: str, limit: int = 10):
-    # 1) ask YouTube Music for candidates
     def _yt():
         return ytm.search(q, filter="songs", limit=limit * 3)
     try:
@@ -141,7 +145,6 @@ async def search(q: str, limit: int = 10):
     except Exception:
         results = []
 
-    # 2) collect their video IDs, build metadata map
     candidates, meta = [], {}
     for item in results:
         vid = item.get("videoId")
@@ -161,10 +164,8 @@ async def search(q: str, limit: int = 10):
     if not candidates:
         return []
 
-    # 3) which of those do we actually have in the channel?
     have = await db_has_many(candidates)
 
-    # 4) build response with stream/download URLs
     out = []
     for vid in candidates:
         if vid not in have:
