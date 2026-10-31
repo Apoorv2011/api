@@ -3,8 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from telethon import TelegramClient
-from telethon.sessions import StringSession
+from hydrogram import Client
 from ytmusicapi import YTMusic
 
 # ============ CONFIG ============
@@ -20,11 +19,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 DB_CHANNEL   = int(os.getenv("ARC_DB_CHANNEL_ID", DEFAULT_CHANNEL_ID))
 ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", DEFAULT_TOKEN)
 
-client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+# Hydrogram client, using string session
+client = Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
 ytm = YTMusic()
 _rebuild_lock = asyncio.Lock()
 
-# ============ STORAGE ============
+# ============ STORAGE (same as before) ============
 if DATABASE_URL:
     import asyncpg
     IS_PG = True
@@ -87,21 +87,16 @@ else:
 
 # ============ INDEXER ============
 def _extract_video_id(msg):
-    txt = (msg.message or "").strip()
+    txt = (msg.caption or "").strip()
     m = re.search(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", txt)
     if m:
         return m.group(1)
-    fname = getattr(msg.document, "file_name", None) if msg.document else None
-    if fname:
-        m = re.search(r"([A-Za-z0-9_-]{11})", fname)
-        if m:
-            return m.group(1)
     return None
 
 async def index_channel():
     batch, count = [], 0
-    async for msg in client.iter_messages(DB_CHANNEL):
-        if not msg.document or not (msg.document.mime_type or "").startswith("audio"):
+    async for msg in client.get_chat_history(DB_CHANNEL):
+        if not msg.audio:
             continue
         vid = _extract_video_id(msg)
         if not vid:
@@ -120,7 +115,7 @@ async def lifespan(app: FastAPI):
     await client.start()
     await db_connect()
     yield
-    await client.disconnect()
+    await client.stop()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -231,8 +226,8 @@ async def _get_msg(msg_id: int):
     row = await db_get_by_msg(msg_id)
     if not row:
         raise HTTPException(404, "not indexed")
-    msg = await client.get_messages(row_channel(row), ids=msg_id)
-    if not msg or not msg.document:
+    msg = await client.get_messages(row_channel(row), msg_id)
+    if not msg or not msg.audio:
         raise HTTPException(404, "file gone")
     return msg
 
@@ -245,28 +240,41 @@ def _parse_range(h, size):
 @app.get("/stream/{msg_id}")
 async def stream(msg_id: int, request: Request):
     msg = await _get_msg(msg_id)
-    size = msg.document.size
+    size = msg.audio.file_size
     s, e, status = _parse_range(request.headers.get("range"), size)
     headers = {"Accept-Ranges":"bytes",
-               "Content-Type": msg.document.mime_type or "audio/mpeg",
+               "Content-Type": msg.audio.mime_type or "audio/mpeg",
                "Content-Length": str(e-s+1)}
     if status == 206:
         headers["Content-Range"] = f"bytes {s}-{e}/{size}"
+
+    # Hydrogram's stream_media streams in chunks, offset is in chunk units (1 MiB per chunk)
+    chunk_size = 1024 * 1024
+    start_chunk = s // chunk_size
+    end_byte = e
+
     async def gen():
         pos = s
-        async for chunk in client.iter_download(msg.media, offset=s):
-            if pos + len(chunk) > e:
-                yield chunk[: e-pos+1]; break
-            yield chunk; pos += len(chunk)
+        async for chunk in client.stream_media(msg, offset=start_chunk):
+            # Need to trim the first chunk to the correct starting offset
+            if pos == s and s % chunk_size != 0:
+                skip = s % chunk_size
+                chunk = chunk[skip:]
+            if pos + len(chunk) > end_byte:
+                yield chunk[: end_byte - pos + 1]
+                break
+            yield chunk
+            pos += len(chunk)
+
     return StreamingResponse(gen(), status_code=status, headers=headers)
 
 @app.get("/download/{msg_id}")
 async def download(msg_id: int):
     msg = await _get_msg(msg_id)
     async def gen():
-        async for chunk in client.iter_download(msg.media):
+        async for chunk in client.stream_media(msg):
             yield chunk
     return StreamingResponse(gen(),
-        media_type=msg.document.mime_type or "audio/mpeg",
+        media_type=msg.audio.mime_type or "audio/mpeg",
         headers={"Content-Disposition": f'attachment; filename="{msg_id}.m4a"',
-                 "Content-Length": str(msg.document.size)})
+                 "Content-Length": str(msg.audio.file_size)})
