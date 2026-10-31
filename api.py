@@ -1,0 +1,271 @@
+import os, re, sqlite3, asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from ytmusicapi import YTMusic
+
+API_ID     = int(os.environ["API_ID"])
+API_HASH   = os.environ["API_HASH"]
+SESSION    = os.environ["SESSION"]
+DB_CHANNEL = int(os.getenv("ARC_DB_CHANNEL_ID", "-1001677848376"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", "123")
+
+client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+ytm = YTMusic()
+_rebuild_lock = asyncio.Lock()
+
+# ---------- storage: only video_id -> msg_id ----------
+if DATABASE_URL:
+    import asyncpg
+    IS_PG = True
+    _pool = None
+    async def db_connect():
+        global _pool
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
+        async with _pool.acquire() as c:
+            await c.execute("""CREATE TABLE IF NOT EXISTS songs (
+                video_id TEXT PRIMARY KEY, msg_id BIGINT NOT NULL,
+                channel_id BIGINT NOT NULL)""")
+            await c.execute("CREATE INDEX IF NOT EXISTS idx_msg ON songs (msg_id)")
+    async def db_upsert(rows):
+        async with _pool.acquire() as c:
+            await c.executemany("""INSERT INTO songs (video_id,msg_id,channel_id)
+                VALUES ($1,$2,$3)
+                ON CONFLICT (video_id) DO UPDATE
+                SET msg_id=EXCLUDED.msg_id, channel_id=EXCLUDED.channel_id""", rows)
+    async def db_get_by_video(vid):
+        async with _pool.acquire() as c:
+            return await c.fetchrow("SELECT * FROM songs WHERE video_id=$1", vid)
+    async def db_get_by_msg(mid):
+        async with _pool.acquire() as c:
+            return await c.fetchrow("SELECT * FROM songs WHERE msg_id=$1", mid)
+    async def db_has_many(vids):
+        async with _pool.acquire() as c:
+            rows = await c.fetch("SELECT video_id FROM songs WHERE video_id = ANY($1::text[])", vids)
+            return {r["video_id"] for r in rows}
+    def row_video(r): return r["video_id"]
+    def row_msg(r): return r["msg_id"]
+    def row_channel(r): return r["channel_id"]
+else:
+    IS_PG = False
+    _conn = None
+    async def db_connect():
+        global _conn
+        _conn = sqlite3.connect("songs.db", check_same_thread=False)
+        _conn.execute("""CREATE TABLE IF NOT EXISTS songs (
+            video_id TEXT PRIMARY KEY, msg_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL)""")
+        _conn.execute("CREATE INDEX IF NOT EXISTS idx_msg ON songs (msg_id)")
+        _conn.commit()
+    async def db_upsert(rows):
+        _conn.executemany("INSERT OR REPLACE INTO songs VALUES (?,?,?)", rows)
+        _conn.commit()
+    async def db_get_by_video(vid):
+        cur = _conn.cursor(); cur.execute("SELECT * FROM songs WHERE video_id=?", (vid,))
+        return cur.fetchone()
+    async def db_get_by_msg(mid):
+        cur = _conn.cursor(); cur.execute("SELECT * FROM songs WHERE msg_id=?", (mid,))
+        return cur.fetchone()
+    async def db_has_many(vids):
+        q = ",".join("?" * len(vids))
+        cur = _conn.cursor()
+        cur.execute(f"SELECT video_id FROM songs WHERE video_id IN ({q})", vids)
+        return {r[0] for r in cur.fetchall()}
+    def row_video(r): return r[0]
+    def row_msg(r): return r[1]
+    def row_channel(r): return r[2]
+
+# ---------- indexer ----------
+def _extract_video_id(msg):
+    txt = (msg.message or "").strip()
+    m = re.search(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", txt)
+    if m:
+        return m.group(1)
+    fname = getattr(msg.document, "file_name", None) if msg.document else None
+    if fname:
+        m = re.search(r"([A-Za-z0-9_-]{11})", fname)
+        if m:
+            return m.group(1)
+    return None
+
+async def index_channel():
+    batch, count = [], 0
+    async for msg in client.iter_messages(DB_CHANNEL):
+        if not msg.document or not (msg.document.mime_type or "").startswith("audio"):
+            continue
+        vid = _extract_video_id(msg)
+        if not vid:
+            continue
+        batch.append((vid, msg.id, DB_CHANNEL))
+        count += 1
+        if len(batch) >= 200:
+            await db_upsert(batch); batch = []
+    if batch:
+        await db_upsert(batch)
+    return count
+
+# ---------- app ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await client.start()
+    await db_connect()
+    yield
+    await client.disconnect()
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["GET","POST"], allow_headers=["*"],
+                   expose_headers=["Content-Range","Accept-Ranges","Content-Length"])
+
+@app.post("/rebuild")
+async def rebuild(token: str = Query("")):
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        raise HTTPException(403)
+    if _rebuild_lock.locked():
+        raise HTTPException(429, "rebuild running")
+    async with _rebuild_lock:
+        return {"indexed": await index_channel()}
+
+# ---------- THE KEY ENDPOINT: search by name ----------
+@app.get("/search")
+async def search(q: str, limit: int = 10):
+    # 1) ask YouTube Music for candidates
+    def _yt():
+        return ytm.search(q, filter="songs", limit=limit * 3)
+    try:
+        results = await asyncio.to_thread(_yt)
+    except Exception:
+        results = []
+
+    # 2) collect their video IDs, build metadata map
+    candidates, meta = [], {}
+    for item in results:
+        vid = item.get("videoId")
+        if not vid or vid in meta:
+            continue
+        artists = item.get("artists") or []
+        thumbs  = item.get("thumbnails") or []
+        meta[vid] = {
+            "video_id": vid,
+            "title":    item.get("title", "Unknown"),
+            "artist":   artists[0].get("name", "Unknown") if artists else "Unknown",
+            "duration": item.get("duration_seconds", 0) or 0,
+            "thumbnail": thumbs[-1].get("url", "") if thumbs else "",
+        }
+        candidates.append(vid)
+
+    if not candidates:
+        return []
+
+    # 3) which of those do we actually have in the channel?
+    have = await db_has_many(candidates)
+
+    # 4) build response with stream/download URLs
+    out = []
+    for vid in candidates:
+        if vid not in have:
+            continue
+        row = await db_get_by_video(vid)
+        mid = row_msg(row)
+        m = meta[vid]
+        out.append({
+            **m,
+            "id": mid,
+            "stream":   f"/stream/{mid}",
+            "download": f"/download/{mid}",
+            "similar":  f"/similar/{vid}",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+@app.get("/similar/{video_id}")
+async def similar(video_id: str, limit: int = 10):
+    try:
+        data = await asyncio.to_thread(
+            lambda: ytm.get_watch_playlist(videoId=video_id, limit=limit + 5)
+        )
+        tracks = data.get("tracks", [])
+        vids = []
+        meta = {}
+        for t in tracks:
+            tid = t.get("videoId")
+            if not tid or tid == video_id:
+                continue
+            artists = t.get("artists") or []
+            thumbs = t.get("thumbnail") or []
+            if isinstance(thumbs, dict): thumbs = [thumbs]
+            meta[tid] = {
+                "video_id": tid,
+                "title":    t.get("title", "Unknown"),
+                "artist":   artists[0].get("name", "Unknown") if artists else "Unknown",
+                "duration": t.get("length", "0:00"),
+                "thumbnail": thumbs[-1].get("url", "") if thumbs else "",
+            }
+            vids.append(tid)
+        if not vids:
+            return []
+        have = await db_has_many(vids)
+        out = []
+        for vid in vids:
+            if vid not in have:
+                continue
+            row = await db_get_by_video(vid)
+            mid = row_msg(row)
+            out.append({**meta[vid], "id": mid,
+                        "stream": f"/stream/{mid}",
+                        "download": f"/download/{mid}",
+                        "similar": f"/similar/{vid}"})
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        return []
+
+async def _get_msg(msg_id: int):
+    row = await db_get_by_msg(msg_id)
+    if not row:
+        raise HTTPException(404, "not indexed")
+    msg = await client.get_messages(row_channel(row), ids=msg_id)
+    if not msg or not msg.document:
+        raise HTTPException(404, "file gone")
+    return msg
+
+def _parse_range(h, size):
+    if not h: return 0, size-1, 200
+    m = re.match(r"bytes=(\d+)-(\d*)", h)
+    s = int(m.group(1)); e = int(m.group(2)) if m.group(2) else size-1
+    return s, e, 206
+
+@app.get("/stream/{msg_id}")
+async def stream(msg_id: int, request: Request):
+    msg = await _get_msg(msg_id)
+    size = msg.document.size
+    s, e, status = _parse_range(request.headers.get("range"), size)
+    headers = {"Accept-Ranges":"bytes",
+               "Content-Type": msg.document.mime_type or "audio/mpeg",
+               "Content-Length": str(e-s+1)}
+    if status == 206:
+        headers["Content-Range"] = f"bytes {s}-{e}/{size}"
+    async def gen():
+        pos = s
+        async for chunk in client.iter_download(msg.media, offset=s):
+            if pos + len(chunk) > e:
+                yield chunk[: e-pos+1]; break
+            yield chunk; pos += len(chunk)
+    return StreamingResponse(gen(), status_code=status, headers=headers)
+
+@app.get("/download/{msg_id}")
+async def download(msg_id: int):
+    msg = await _get_msg(msg_id)
+    async def gen():
+        async for chunk in client.iter_download(msg.media):
+            yield chunk
+    return StreamingResponse(gen(),
+        media_type=msg.document.mime_type or "audio/mpeg",
+        headers={"Content-Disposition": f'attachment; filename="{msg_id}.m4a"',
+                 "Content-Length": str(msg.document.size)})
