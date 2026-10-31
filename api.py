@@ -19,12 +19,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 DB_CHANNEL   = int(os.getenv("ARC_DB_CHANNEL_ID", DEFAULT_CHANNEL_ID))
 ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", DEFAULT_TOKEN)
 
-# Hydrogram client, using string session
-client = Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
+client = None            # created inside lifespan so a loop exists
 ytm = YTMusic()
 _rebuild_lock = asyncio.Lock()
 
-# ============ STORAGE (same as before) ============
+# ============ STORAGE ============
 if DATABASE_URL:
     import asyncpg
     IS_PG = True
@@ -112,6 +111,8 @@ async def index_channel():
 # ============ APP ============
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global client
+    client = Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
     await client.start()
     await db_connect()
     yield
@@ -248,7 +249,6 @@ async def stream(msg_id: int, request: Request):
     if status == 206:
         headers["Content-Range"] = f"bytes {s}-{e}/{size}"
 
-    # Hydrogram's stream_media streams in chunks, offset is in chunk units (1 MiB per chunk)
     chunk_size = 1024 * 1024
     start_chunk = s // chunk_size
     end_byte = e
@@ -256,7 +256,6 @@ async def stream(msg_id: int, request: Request):
     async def gen():
         pos = s
         async for chunk in client.stream_media(msg, offset=start_chunk):
-            # Need to trim the first chunk to the correct starting offset
             if pos == s and s % chunk_size != 0:
                 skip = s % chunk_size
                 chunk = chunk[skip:]
