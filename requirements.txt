@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
 hydrogram
+TgCrypto
 asyncpg
 ytmusicapi
