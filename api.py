@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from hydrogram import Client
+from pyrogram import Client
 from ytmusicapi import YTMusic
 
 # ============ CONFIG ============
@@ -87,18 +87,12 @@ else:
 _rebuild_state = {"running": False, "indexed": 0, "done": False, "error": None}
 
 def _extract_video_id(msg):
-    # 1. Check caption first
     txt = (msg.caption or "").strip()
-    
-    # Matches ID optionally followed by a file extension (.mp3, .webm, etc.) at the end of string
     m = re.search(r"([A-Za-z0-9_-]{11})(?:\.[a-zA-Z0-9]{2,4})?$", txt)
     if not m:
-        # Fallback to find ID anywhere in the caption
         m = re.search(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", txt)
-    if m: 
-        return m.group(1)
+    if m: return m.group(1)
 
-    # 2. Fallback to filename
     file_name = None
     if msg.audio: file_name = msg.audio.file_name
     elif msg.video: file_name = msg.video.file_name
@@ -106,9 +100,7 @@ def _extract_video_id(msg):
     
     if file_name:
         m = re.search(r"([A-Za-z0-9_-]{11})(?:\.[a-zA-Z0-9]{2,4})?$", file_name)
-        if m:
-            return m.group(1)
-
+        if m: return m.group(1)
     return None
 
 async def index_channel():
@@ -117,14 +109,11 @@ async def index_channel():
     batch, count = [], 0
     try:
         async for msg in client.get_chat_history(DB_CHANNEL):
-            # Check if it's audio, video, or a document (which might be an audio/video file)
             if not (msg.audio or msg.video or msg.document):
                 continue
-            
             vid = _extract_video_id(msg)
             if not vid: 
                 continue
-                
             batch.append((vid, msg.id, DB_CHANNEL))
             count += 1
             _rebuild_state["indexed"] = count
@@ -167,8 +156,6 @@ async def get_by_id(video_id: str):
     row = await db_get_by_video(video_id)
     if not row: raise HTTPException(404, "Song ID not found in channel index")
     mid = row_msg(row)
-    
-    # Get metadata from YouTube Music
     try:
         info = await asyncio.to_thread(lambda: ytm.get_song(video_id).get("videoDetails", {}))
         title = info.get("title", "Unknown")
@@ -177,11 +164,7 @@ async def get_by_id(video_id: str):
         thumb = thumbnails[-1].get("url", "") if thumbnails else ""
     except Exception:
         title, artist, thumb = video_id, "Unknown", ""
-
-    return {
-        "id": mid, "video_id": video_id, "title": title, "artist": artist, "thumbnail": thumb,
-        "stream": f"/stream/{mid}", "download": f"/download/{mid}", "similar": f"/similar/{video_id}"
-    }
+    return {"id": mid, "video_id": video_id, "title": title, "artist": artist, "thumbnail": thumb, "stream": f"/stream/{mid}", "download": f"/download/{mid}", "similar": f"/similar/{video_id}"}
 
 @app.get("/search")
 async def search(q: str, limit: int = 10):
@@ -248,7 +231,6 @@ def _parse_range(h, size):
     s = int(m.group(1)); e = int(m.group(2)) if m.group(2) else size-1
     return s, e, 206
 
-# Helper to get media info dynamically (Audio or Video)
 def _get_media_info(msg):
     if msg.audio:
         return msg.audio, msg.audio.file_size, msg.audio.mime_type or "audio/mpeg", "m4a"
@@ -264,7 +246,6 @@ def _get_media_info(msg):
 async def stream(msg_id: int, request: Request):
     msg = await _get_msg(msg_id)
     media, size, mime, _ = _get_media_info(msg)
-    
     if not media: raise HTTPException(404, "No media found")
     
     s, e, status = _parse_range(request.headers.get("range"), size)
@@ -277,6 +258,7 @@ async def stream(msg_id: int, request: Request):
     
     async def gen():
         pos = s
+        # Pyrogram's iter_download uses byte offset directly
         async for chunk in client.stream_media(msg, offset=start_chunk):
             if pos == s and s % chunk_size != 0:
                 skip = s % chunk_size
@@ -292,7 +274,6 @@ async def stream(msg_id: int, request: Request):
 async def download(msg_id: int):
     msg = await _get_msg(msg_id)
     media, size, mime, ext = _get_media_info(msg)
-    
     if not media: raise HTTPException(404, "No media found")
     
     async def gen():
